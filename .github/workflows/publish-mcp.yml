@@ -7,9 +7,11 @@ on:
 
 jobs:
   build-and-test:
+    if: github.repository == 'svnscha/mcp-windbg'
     uses: ./.github/workflows/build-and-test.yml
 
   verify-build:
+    if: github.repository == 'svnscha/mcp-windbg'
     runs-on: windows-latest
     needs: build-and-test
 
@@ -26,6 +28,7 @@ jobs:
         Get-ChildItem -Path "dist/" -Recurse | Format-Table Name, Length, LastWriteTime
 
   publish-pypi:
+    if: github.repository == 'svnscha/mcp-windbg'
     runs-on: ubuntu-latest
     needs: build-and-test
     permissions:
@@ -68,7 +71,7 @@ jobs:
   create-github-release:
     runs-on: ubuntu-latest
     needs: [build-and-test, publish-pypi]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'svnscha/mcp-windbg' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write  # Required to create releases
 

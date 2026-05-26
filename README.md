@@ -1,12 +1,12 @@
 # MCP Server for WinDbg Crash Analysis
 
-A Model Context Protocol server that bridges AI models with WinDbg for crash dump analysis and remote debugging.
+A Model Context Protocol server that bridges AI models with WinDbg for crash dump analysis, remote debugging, and live kernel debugging.
 
 <!-- mcp-name: io.github.svnscha/mcp-windbg -->
 
 ## Overview
 
-This MCP server integrates with [CDB](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/opening-a-crash-dump-file-using-cdb) to enable AI models to analyze Windows crash dumps and connect to remote debugging sessions using WinDbg/CDB.
+This MCP server integrates with [CDB](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/opening-a-crash-dump-file-using-cdb) and KD to enable AI models to analyze Windows crash dumps, connect to remote debugging sessions, and inspect live kernel debugging targets.
 
 ## What is this?
 
@@ -20,6 +20,7 @@ Not a magical auto-fix solution. It's a Python wrapper around CDB that leverages
 
 - **Crash Dump Analysis**: Examine Windows crash dumps
 - **Live Debugging**: Connect to remote debugging targets
+- **Live Kernel Debugging**: Connect to KD targets or local kernel debugging
 - **Directory Analysis**: Process multiple dumps for patterns
 
 ## Quick Start
@@ -29,6 +30,7 @@ Not a magical auto-fix solution. It's a Python wrapper around CDB that leverages
 - Python 3.10 or higher
 - Any MCP-compatible client (GitHub Copilot, Claude Desktop, Cline, Cursor, Windsurf etc.)
 - Configure MCP server in your chosen client
+- For live kernel debugging, configure the target machine separately for KDNET, USB, COM, or local kernel debugging. Local kernel debugging requires `/debug` boot configuration and Administrator rights.
 
 > [!TIP]
 > In enterprise environments, MCP server usage might be restricted by organizational policies. Check with your IT team about AI tool usage and ensure you have the necessary permissions before proceeding.
@@ -69,6 +71,7 @@ Endpoint: `http://127.0.0.1:8000/mcp`
 --host HOST                              HTTP server host (default: 127.0.0.1)
 --port PORT                              HTTP server port (default: 8000)
 --cdb-path PATH                          Custom path to cdb.exe
+--kd-path PATH                           Custom path to kd.exe
 --symbols-path PATH                      Custom symbols path
 --timeout SECONDS                        Command timeout (default: 30)
 --verbose                                Enable verbose output
@@ -143,6 +146,9 @@ The beauty of MCP is that you write the server once, and it works everywhere. Ch
 | [`close_windbg_dump`](https://github.com/svnscha/mcp-windbg/wiki/Tools#close_windbg_dump) | Cleanup dump sessions | Resource management |
 | [`open_windbg_remote`](https://github.com/svnscha/mcp-windbg/wiki/Tools#open_windbg_remote) | Connect to remote debugging | Live debugging sessions |
 | [`close_windbg_remote`](https://github.com/svnscha/mcp-windbg/wiki/Tools#close_windbg_remote) | Cleanup remote sessions | Resource management |
+| `open_windbg_kernel` | Connect to a KD live kernel session | Kernel debugging over KDNET, USB, or COM |
+| `open_windbg_local_kernel` | Connect to local kernel debugging | Local kernel inspection |
+| `close_windbg_kernel` | Cleanup kernel sessions | Resource management |
 | [`run_windbg_cmd`](https://github.com/svnscha/mcp-windbg/wiki/Tools#run_windbg_cmd) | Execute WinDbg commands | Custom analysis and investigation |
 | [`send_ctrl_break`](https://github.com/svnscha/mcp-windbg/wiki/Tools#send_ctrl_break) | Break into a running target | Interrupt execution during live debugging |
 
@@ -177,6 +183,16 @@ The beauty of MCP is that you write the server once, and it works everywhere. Ch
 > "Check for timing issues in the thread pool with !runaway and !threads"
 
 > "Show me all threads with ~*k and identify which one is causing the hang"
+
+### Live Kernel Debugging
+
+> "Connect to kernel target net:port=50000,key=1.2.3.4 and show vertarget"
+
+> "Connect to kernel target com:port=\\\\.\\pipe\\kd_Windows_10_x64,baud=115200,pipe,reconnect and break on connection"
+
+> "Open local kernel debugging and list loaded kernel modules with lm"
+
+> "Send CTRL+BREAK to the kernel session, then run !locks"
 
 ## Blog
 

@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
-# Dictionary to store CDB sessions keyed by dump file path
+# Dictionary to store debugger sessions keyed by target identifier
 active_sessions: Dict[str, CDBSession] = {}
 
 def get_local_dumps_path() -> Optional[str]:
@@ -68,19 +68,40 @@ class OpenWindbgRemote(BaseModel):
     include_threads: bool = Field(default=False, description="Whether to include thread information")
 
 
+class OpenWindbgKernel(BaseModel):
+    """Parameters for connecting to a live kernel debug session."""
+    connection_string: str = Field(description="KD connection string (e.g., 'net:port=50000,key=...', 'com:port=COM1,baud=115200')")
+    break_on_connection: bool = Field(default=True, description="Whether to pass -b so KD breaks into the target as soon as the session begins")
+    include_basic_info: bool = Field(default=True, description="Whether to include target and event information")
+    include_modules: bool = Field(default=False, description="Whether to include loaded kernel module information")
+
+
+class OpenWindbgLocalKernel(BaseModel):
+    """Parameters for connecting to the local kernel."""
+    break_on_connection: bool = Field(default=False, description="Whether to pass -b so KD breaks into the target as soon as the session begins")
+    include_basic_info: bool = Field(default=True, description="Whether to include target and event information")
+    include_modules: bool = Field(default=False, description="Whether to include loaded kernel module information")
+
+
 class RunWindbgCmdParams(BaseModel):
     """Parameters for executing a WinDbg command."""
     dump_path: Optional[str] = Field(default=None, description="Path to the Windows crash dump file")
     connection_string: Optional[str] = Field(default=None, description="Remote connection string (e.g., 'tcp:Port=5005,Server=192.168.0.100')")
+    kernel_connection: Optional[str] = Field(default=None, description="KD kernel connection string (e.g., 'net:port=50000,key=...')")
+    local_kernel: bool = Field(default=False, description="Run the command on the local kernel debugging session")
     command: str = Field(description="WinDbg command to execute")
 
     @model_validator(mode='after')
     def validate_connection_params(self):
-        """Validate that exactly one of dump_path or connection_string is provided."""
-        if not self.dump_path and not self.connection_string:
-            raise ValueError("Either dump_path or connection_string must be provided")
-        if self.dump_path and self.connection_string:
-            raise ValueError("dump_path and connection_string are mutually exclusive")
+        """Validate that exactly one target selector is provided."""
+        target_count = sum(bool(target) for target in [
+            self.dump_path,
+            self.connection_string,
+            self.kernel_connection,
+            self.local_kernel,
+        ])
+        if target_count != 1:
+            raise ValueError("Exactly one of dump_path, connection_string, kernel_connection, or local_kernel must be provided")
         return self
 
 
@@ -92,6 +113,18 @@ class CloseWindbgDumpParams(BaseModel):
 class CloseWindbgRemoteParams(BaseModel):
     """Parameters for closing a remote debugging connection."""
     connection_string: str = Field(description="Remote connection string to close")
+
+
+class CloseWindbgKernelParams(BaseModel):
+    """Parameters for closing a live kernel debugging connection."""
+    connection_string: Optional[str] = Field(default=None, description="KD connection string to close")
+    local_kernel: bool = Field(default=False, description="Close the local kernel debugging session")
+
+    @model_validator(mode='after')
+    def validate_connection_params(self):
+        if bool(self.connection_string) == bool(self.local_kernel):
+            raise ValueError("Exactly one of connection_string or local_kernel must be provided")
+        return self
 
 
 class ListWindbgDumpsParams(BaseModel):
@@ -110,42 +143,61 @@ class SendCtrlBreakParams(BaseModel):
     """Parameters for sending CTRL+BREAK to a CDB/WinDbg session."""
     dump_path: Optional[str] = Field(default=None, description="Path to the Windows crash dump file")
     connection_string: Optional[str] = Field(default=None, description="Remote connection string (e.g., 'tcp:Port=5005,Server=192.168.0.100')")
+    kernel_connection: Optional[str] = Field(default=None, description="KD kernel connection string (e.g., 'net:port=50000,key=...')")
+    local_kernel: bool = Field(default=False, description="Send CTRL+BREAK to the local kernel debugging session")
 
     @model_validator(mode='after')
     def validate_connection_params(self):
-        if not self.dump_path and not self.connection_string:
-            raise ValueError("Either dump_path or connection_string must be provided")
-        if self.dump_path and self.connection_string:
-            raise ValueError("dump_path and connection_string are mutually exclusive")
+        target_count = sum(bool(target) for target in [
+            self.dump_path,
+            self.connection_string,
+            self.kernel_connection,
+            self.local_kernel,
+        ])
+        if target_count != 1:
+            raise ValueError("Exactly one of dump_path, connection_string, kernel_connection, or local_kernel must be provided")
         return self
 
 
 def get_or_create_session(
     dump_path: Optional[str] = None,
     connection_string: Optional[str] = None,
+    kernel_connection: Optional[str] = None,
+    local_kernel: bool = False,
+    break_on_connection: bool = False,
+    defer_initial_prompt: bool = False,
     cdb_path: Optional[str] = None,
+    kd_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False
 ) -> CDBSession:
-    """Get an existing CDB session or create a new one."""
-    if not dump_path and not connection_string:
-        raise ValueError("Either dump_path or connection_string must be provided")
-    if dump_path and connection_string:
-        raise ValueError("dump_path and connection_string are mutually exclusive")
+    """Get an existing debugger session or create a new one."""
+    target_count = sum(bool(target) for target in [dump_path, connection_string, kernel_connection, local_kernel])
+    if target_count != 1:
+        raise ValueError("Exactly one debugger target must be provided")
 
     # Create session identifier
     if dump_path:
         session_id = os.path.abspath(dump_path)
-    else:
+    elif connection_string:
         session_id = f"remote:{connection_string}"
+    elif kernel_connection:
+        session_id = f"kernel:{kernel_connection}"
+    else:
+        session_id = "kernel:local"
 
     if session_id not in active_sessions or active_sessions[session_id] is None:
         try:
             session = CDBSession(
                 dump_path=dump_path,
                 remote_connection=connection_string,
+                kernel_connection=kernel_connection,
+                local_kernel=local_kernel,
+                break_on_connection=break_on_connection,
+                defer_initial_prompt=defer_initial_prompt,
                 cdb_path=cdb_path,
+                kd_path=kd_path,
                 symbols_path=symbols_path,
                 timeout=timeout,
                 verbose=verbose
@@ -155,24 +207,32 @@ def get_or_create_session(
         except Exception as e:
             raise McpError(ErrorData(
                 code=INTERNAL_ERROR,
-                message=f"Failed to create CDB session: {str(e)}"
+                message=f"Failed to create debugger session: {str(e)}"
             ))
 
     return active_sessions[session_id]
 
 
-def unload_session(dump_path: Optional[str] = None, connection_string: Optional[str] = None) -> bool:
-    """Unload and clean up a CDB session."""
-    if not dump_path and not connection_string:
-        return False
-    if dump_path and connection_string:
+def unload_session(
+    dump_path: Optional[str] = None,
+    connection_string: Optional[str] = None,
+    kernel_connection: Optional[str] = None,
+    local_kernel: bool = False,
+) -> bool:
+    """Unload and clean up a debugger session."""
+    target_count = sum(bool(target) for target in [dump_path, connection_string, kernel_connection, local_kernel])
+    if target_count != 1:
         return False
 
     # Create session identifier
     if dump_path:
         session_id = os.path.abspath(dump_path)
-    else:
+    elif connection_string:
         session_id = f"remote:{connection_string}"
+    elif kernel_connection:
+        session_id = f"kernel:{kernel_connection}"
+    else:
+        session_id = "kernel:local"
 
     if session_id in active_sessions and active_sessions[session_id] is not None:
         try:
@@ -205,8 +265,21 @@ def execute_common_analysis_commands(session: CDBSession) -> dict:
     return results
 
 
+def append_optional_command_result(results: list[str], session: CDBSession, title: str, command: str, timeout: int) -> None:
+    """Append command output if the debugger is at a prompt; otherwise append status text."""
+    try:
+        output = session.send_command(command, timeout=timeout)
+        results.append(f"### {title}\n```\n" + "\n".join(output) + "\n```\n\n")
+    except CDBError as e:
+        results.append(
+            f"### {title}\n"
+            f"Debugger session is running, but KD did not return a prompt yet: {str(e)}\n\n"
+        )
+
+
 async def serve(
     cdb_path: Optional[str] = None,
+    kd_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
@@ -215,11 +288,12 @@ async def serve(
 
     Args:
         cdb_path: Optional custom path to cdb.exe
+        kd_path: Optional custom path to kd.exe
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
     """
-    server = _create_server(cdb_path, symbols_path, timeout, verbose)
+    server = _create_server(cdb_path, kd_path, symbols_path, timeout, verbose)
 
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
@@ -230,6 +304,7 @@ async def serve_http(
     host: str = "127.0.0.1",
     port: int = 8000,
     cdb_path: Optional[str] = None,
+    kd_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
@@ -240,6 +315,7 @@ async def serve_http(
         host: Host to bind the HTTP server to
         port: Port to bind the HTTP server to
         cdb_path: Optional custom path to cdb.exe
+        kd_path: Optional custom path to kd.exe
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
@@ -249,7 +325,7 @@ async def serve_http(
     from starlette.types import Receive, Scope, Send
     import uvicorn
 
-    server = _create_server(cdb_path, symbols_path, timeout, verbose)
+    server = _create_server(cdb_path, kd_path, symbols_path, timeout, verbose)
 
     # Create the session manager
     session_manager = StreamableHTTPSessionManager(
@@ -285,6 +361,7 @@ async def serve_http(
 
 def _create_server(
     cdb_path: Optional[str] = None,
+    kd_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
@@ -293,6 +370,7 @@ def _create_server(
 
     Args:
         cdb_path: Optional custom path to cdb.exe
+        kd_path: Optional custom path to kd.exe
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
@@ -322,9 +400,25 @@ def _create_server(
                 inputSchema=OpenWindbgRemote.model_json_schema(),
             ),
             Tool(
+                name="open_windbg_kernel",
+                description="""
+                Connect to a live kernel debugging session using KD.
+                The connection string is passed to kd.exe with -k, such as net:port=50000,key=...
+                """,
+                inputSchema=OpenWindbgKernel.model_json_schema(),
+            ),
+            Tool(
+                name="open_windbg_local_kernel",
+                description="""
+                Connect to the local kernel using kd.exe -kl.
+                Requires local kernel debugging to be enabled and the MCP server to run elevated.
+                """,
+                inputSchema=OpenWindbgLocalKernel.model_json_schema(),
+            ),
+            Tool(
                 name="run_windbg_cmd",
                 description="""
-                Execute a specific WinDbg command on a loaded crash dump or remote session.
+                Execute a specific WinDbg command on a loaded crash dump, remote session, or kernel session.
                 This tool allows you to run any WinDbg command and get the output.
                 """,
                 inputSchema=RunWindbgCmdParams.model_json_schema(),
@@ -332,7 +426,7 @@ def _create_server(
             Tool(
                 name="send_ctrl_break",
                 description="""
-                Send a CTRL+BREAK event to the active CDB/WinDbg session, causing it to break in.
+                Send a CTRL+BREAK event to the active debugger session, causing it to break in.
                 Useful for interrupting a running target or breaking into a remote session.
                 """,
                 inputSchema=SendCtrlBreakParams.model_json_schema(),
@@ -352,6 +446,14 @@ def _create_server(
                 Use this tool when you're done with a remote debugging session to free up resources.
                 """,
                 inputSchema=CloseWindbgRemoteParams.model_json_schema(),
+            ),
+            Tool(
+                name="close_windbg_kernel",
+                description="""
+                Close a live kernel debugging connection and release resources.
+                Use this tool when you're done with a KD session to free up resources.
+                """,
+                inputSchema=CloseWindbgKernelParams.model_json_schema(),
             ),
             Tool(
                 name="list_windbg_dumps",
@@ -461,11 +563,66 @@ def _create_server(
                     text="".join(results)
                 )]
 
+            elif name == "open_windbg_kernel":
+                args = OpenWindbgKernel(**arguments)
+                session = get_or_create_session(
+                    kernel_connection=args.connection_string,
+                    break_on_connection=args.break_on_connection,
+                    defer_initial_prompt=True,
+                    kd_path=kd_path,
+                    symbols_path=symbols_path,
+                    timeout=timeout,
+                    verbose=verbose
+                )
+
+                results = []
+                if args.break_on_connection:
+                    session.send_ctrl_break()
+                    results.append("Sent CTRL+BREAK to the kernel debugger session.\n\n")
+
+                if args.include_basic_info:
+                    append_optional_command_result(results, session, "Kernel Target", "vertarget", timeout)
+                    append_optional_command_result(results, session, "Last Event", ".lastevent", timeout)
+                    append_optional_command_result(results, session, "Current Registers", "r", timeout)
+
+                if args.include_modules:
+                    append_optional_command_result(results, session, "Loaded Kernel Modules", "lm", timeout)
+
+                return [TextContent(type="text", text="".join(results))]
+
+            elif name == "open_windbg_local_kernel":
+                args = OpenWindbgLocalKernel(**arguments)
+                session = get_or_create_session(
+                    local_kernel=True,
+                    break_on_connection=args.break_on_connection,
+                    defer_initial_prompt=True,
+                    kd_path=kd_path,
+                    symbols_path=symbols_path,
+                    timeout=timeout,
+                    verbose=verbose
+                )
+
+                results = []
+                if args.break_on_connection:
+                    session.send_ctrl_break()
+                    results.append("Sent CTRL+BREAK to the local kernel debugger session.\n\n")
+
+                if args.include_basic_info:
+                    append_optional_command_result(results, session, "Local Kernel Target", "vertarget", timeout)
+                    append_optional_command_result(results, session, "Last Event", ".lastevent", timeout)
+                    append_optional_command_result(results, session, "Current Registers", "r", timeout)
+
+                if args.include_modules:
+                    append_optional_command_result(results, session, "Loaded Kernel Modules", "lm", timeout)
+
+                return [TextContent(type="text", text="".join(results))]
+
             elif name == "run_windbg_cmd":
                 args = RunWindbgCmdParams(**arguments)
                 session = get_or_create_session(
                     dump_path=args.dump_path, connection_string=args.connection_string,
-                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    kernel_connection=args.kernel_connection, local_kernel=args.local_kernel,
+                    cdb_path=cdb_path, kd_path=kd_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
                 )
                 output = session.send_command(args.command)
 
@@ -478,13 +635,21 @@ def _create_server(
                 args = SendCtrlBreakParams(**arguments)
                 session = get_or_create_session(
                     dump_path=args.dump_path, connection_string=args.connection_string,
-                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    kernel_connection=args.kernel_connection, local_kernel=args.local_kernel,
+                    cdb_path=cdb_path, kd_path=kd_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
                 )
                 session.send_ctrl_break()
-                target = args.dump_path if args.dump_path else f"remote: {args.connection_string}"
+                if args.dump_path:
+                    target = args.dump_path
+                elif args.connection_string:
+                    target = f"remote: {args.connection_string}"
+                elif args.kernel_connection:
+                    target = f"kernel: {args.kernel_connection}"
+                else:
+                    target = "kernel: local"
                 return [TextContent(
                     type="text",
-                    text=f"Sent CTRL+BREAK to CDB session ({target})."
+                    text=f"Sent CTRL+BREAK to debugger session ({target})."
                 )]
 
             elif name == "close_windbg_dump":
@@ -513,6 +678,21 @@ def _create_server(
                     return [TextContent(
                         type="text",
                         text=f"No active session found for remote connection: {args.connection_string}"
+                    )]
+
+            elif name == "close_windbg_kernel":
+                args = CloseWindbgKernelParams(**arguments)
+                success = unload_session(kernel_connection=args.connection_string, local_kernel=args.local_kernel)
+                target = args.connection_string if args.connection_string else "local kernel"
+                if success:
+                    return [TextContent(
+                        type="text",
+                        text=f"Successfully closed kernel connection: {target}"
+                    )]
+                else:
+                    return [TextContent(
+                        type="text",
+                        text=f"No active session found for kernel connection: {target}"
                     )]
 
             elif name == "list_windbg_dumps":
@@ -645,8 +825,8 @@ def _create_server(
 
 # Clean up function to ensure all sessions are closed when the server exits
 def cleanup_sessions():
-    """Close all active CDB sessions."""
-    for dump_path, session in active_sessions.items():
+    """Close all active debugger sessions."""
+    for session_id, session in active_sessions.items():
         try:
             if session is not None:
                 session.shutdown()

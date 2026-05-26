@@ -8,4 +8,5 @@ on:
 
 jobs:
   build-and-test:
+    if: github.repository == 'svnscha/mcp-windbg'
     uses: ./.github/workflows/build-and-test.yml

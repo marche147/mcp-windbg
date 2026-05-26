@@ -27,6 +27,13 @@
           "name": "CDB_PATH"
         },
         {
+          "description": "Custom path to kd.exe (optional)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "KD_PATH"
+        },
+        {
           "description": "Symbol path for Windows debugging (optional, defaults to Microsoft symbol server)",
           "isRequired": false,
           "format": "string",
@@ -66,6 +73,13 @@
           "format": "string",
           "isSecret": false,
           "name": "CDB_PATH"
+        },
+        {
+          "description": "Custom path to kd.exe (optional)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "KD_PATH"
         },
         {
           "description": "Symbol path for Windows debugging (optional, defaults to Microsoft symbol server)",

@@ -185,10 +185,10 @@ class TestRemoteDebugging:
     def test_remote_connection_validation(self):
         """Test validation of remote connection parameters."""
         # Test that CDBSession validates parameters correctly
-        with pytest.raises(ValueError, match="Either dump_path or remote_connection must be provided"):
+        with pytest.raises(ValueError, match="Exactly one debugger target must be provided"):
             CDBSession()
 
-        with pytest.raises(ValueError, match="dump_path and remote_connection are mutually exclusive"):
+        with pytest.raises(ValueError, match="Exactly one debugger target must be provided"):
             CDBSession(dump_path="test.dmp", remote_connection="tcp:Port=5005,Server=127.0.0.1")
 
     def test_send_ctrl_break(self):

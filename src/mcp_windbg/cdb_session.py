@@ -6,7 +6,7 @@ import platform
 import signal
 from typing import List, Optional
 
-# Regular expression to detect CDB prompts
+# Regular expression to detect debugger prompts
 PROMPT_REGEX = re.compile(r"^\d+:\d+>\s*$")
 
 # Command marker to reliably detect command completion
@@ -27,8 +27,22 @@ DEFAULT_CDB_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe")
 ]
 
+# Default paths where kd.exe might be located
+DEFAULT_KD_PATHS = [
+    # Traditional Windows SDK locations
+    r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe",
+    r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\kd.exe",
+    r"C:\Program Files\Debugging Tools for Windows (x64)\kd.exe",
+    r"C:\Program Files\Debugging Tools for Windows (x86)\kd.exe",
+
+    # Microsoft Store WinDbg Preview locations (architecture-specific)
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\kdX64.exe"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\kdX86.exe"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\kdARM64.exe")
+]
+
 class CDBError(Exception):
-    """Custom exception for CDB-related errors"""
+    """Custom exception for debugger-related errors"""
     pass
 
 class CDBSession:
@@ -36,7 +50,12 @@ class CDBSession:
         self,
         dump_path: Optional[str] = None,
         remote_connection: Optional[str] = None,
+        kernel_connection: Optional[str] = None,
+        local_kernel: bool = False,
+        break_on_connection: bool = False,
+        defer_initial_prompt: bool = False,
         cdb_path: Optional[str] = None,
+        kd_path: Optional[str] = None,
         symbols_path: Optional[str] = None,
         initial_commands: Optional[List[str]] = None,
         timeout: int = 10,
@@ -44,12 +63,17 @@ class CDBSession:
         additional_args: Optional[List[str]] = None
     ):
         """
-        Initialize a new CDB debugging session.
+        Initialize a new debugger session.
 
         Args:
             dump_path: Path to the crash dump file (mutually exclusive with remote_connection)
             remote_connection: Remote debugging connection string (e.g., "tcp:Port=5005,Server=192.168.0.100")
+            kernel_connection: KD kernel debugging connection string (e.g., "net:port=50000,key=...")
+            local_kernel: Whether to start local kernel debugging with kd.exe -kl
+            break_on_connection: Whether to pass -b for KD live debugging
+            defer_initial_prompt: Whether to allow session creation before KD reaches a command prompt
             cdb_path: Custom path to cdb.exe. If None, will try to find it automatically
+            kd_path: Custom path to kd.exe. If None, will try to find it automatically
             symbols_path: Custom symbols path. If None, uses default Windows symbols
             initial_commands: List of commands to run when CDB starts
             timeout: Timeout in seconds for waiting for CDB responses
@@ -57,37 +81,57 @@ class CDBSession:
             additional_args: Additional arguments to pass to cdb.exe
 
         Raises:
-            CDBError: If cdb.exe cannot be found or started
+            CDBError: If the debugger executable cannot be found or started
             FileNotFoundError: If the dump file cannot be found
             ValueError: If invalid parameters are provided
         """
-        # Validate that exactly one of dump_path or remote_connection is provided
-        if not dump_path and not remote_connection:
-            raise ValueError("Either dump_path or remote_connection must be provided")
-        if dump_path and remote_connection:
-            raise ValueError("dump_path and remote_connection are mutually exclusive")
+        # Validate that exactly one target type is provided
+        target_count = sum(bool(target) for target in [dump_path, remote_connection, kernel_connection, local_kernel])
+        if target_count != 1:
+            raise ValueError("Exactly one debugger target must be provided")
 
         if dump_path and not os.path.isfile(dump_path):
             raise FileNotFoundError(f"Dump file not found: {dump_path}")
 
         self.dump_path = dump_path
         self.remote_connection = remote_connection
+        self.kernel_connection = kernel_connection
+        self.local_kernel = local_kernel
+        self.break_on_connection = break_on_connection
+        self.defer_initial_prompt = defer_initial_prompt
+        self.prompt_ready = False
         self.timeout = timeout
         self.verbose = verbose
+        self.is_kernel = bool(kernel_connection or local_kernel)
 
-        # Find cdb executable
-        self.cdb_path = self._find_cdb_executable(cdb_path)
-        if not self.cdb_path:
-            raise CDBError("Could not find cdb.exe. Please provide a valid path.")
+        # Find debugger executable
+        if self.is_kernel:
+            self.debugger_path = self._find_kd_executable(kd_path)
+            if not self.debugger_path:
+                raise CDBError("Could not find kd.exe. Please provide a valid path.")
+        else:
+            self.debugger_path = self._find_cdb_executable(cdb_path)
+            if not self.debugger_path:
+                raise CDBError("Could not find cdb.exe. Please provide a valid path.")
+
+        # Backward-compatible attribute used by existing callers/tests.
+        self.cdb_path = self.debugger_path
 
         # Prepare command args
-        cmd_args = [self.cdb_path]
+        cmd_args = [self.debugger_path]
+
+        if self.is_kernel and self.break_on_connection:
+            cmd_args.append("-b")
 
         # Add connection type specific arguments
         if self.dump_path:
             cmd_args.extend(["-z", self.dump_path])
         elif self.remote_connection:
             cmd_args.extend(["-remote", self.remote_connection])
+        elif self.kernel_connection:
+            cmd_args.extend(["-k", self.kernel_connection])
+        elif self.local_kernel:
+            cmd_args.append("-kl")
 
         # Add symbols path if provided
         if symbols_path:
@@ -98,9 +142,9 @@ class CDBSession:
             cmd_args.extend(additional_args)
 
         try:
-            # Only create a new process group for remote sessions where CTRL+BREAK is needed
+            # Create a new process group for live sessions where CTRL+BREAK is needed
             creationflags = 0
-            if os.name == 'nt' and self.remote_connection:
+            if os.name == 'nt' and (self.remote_connection or self.is_kernel):
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
             self.process = subprocess.Popen(
@@ -122,12 +166,18 @@ class CDBSession:
         self.reader_thread.daemon = True
         self.reader_thread.start()
 
-        # Wait for CDB to initialize by sending an echo marker
+        # Wait for debugger to initialize by sending an echo marker.
+        # VirtualKD pipe sessions can open before the target responds; allow
+        # live KD callers to create a session and break in after launch.
         try:
             self._wait_for_prompt(timeout=self.timeout)
+            self.prompt_ready = True
         except CDBError:
-            self.shutdown()
-            raise CDBError("CDB initialization timed out")
+            if self.is_kernel and self.defer_initial_prompt:
+                self.prompt_ready = False
+            else:
+                self.shutdown()
+                raise CDBError("Debugger initialization timed out")
 
         # Run initial commands if provided
         if initial_commands:
@@ -136,17 +186,34 @@ class CDBSession:
 
     def _find_cdb_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
         """Find the cdb.exe executable"""
+        return self._find_debugger_executable(custom_path, "CDB_PATH", DEFAULT_CDB_PATHS)
+
+    def _find_kd_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
+        """Find the kd.exe executable"""
+        return self._find_debugger_executable(custom_path, "KD_PATH", DEFAULT_KD_PATHS)
+
+    def _find_debugger_executable(
+        self,
+        custom_path: Optional[str],
+        env_var: str,
+        default_paths: List[str],
+    ) -> Optional[str]:
+        """Find a debugger executable from a custom path or default path list."""
         if custom_path and os.path.isfile(custom_path):
             return custom_path
 
-        for path in DEFAULT_CDB_PATHS:
+        env_path = os.environ.get(env_var)
+        if env_path and os.path.isfile(env_path):
+            return env_path
+
+        for path in default_paths:
             if os.path.isfile(path):
                 return path
 
         return None
 
     def _read_output(self):
-        """Thread function to continuously read CDB output"""
+        """Thread function to continuously read debugger output"""
         if not self.process or not self.process.stdout:
             return
 
@@ -155,7 +222,7 @@ class CDBSession:
             for line in self.process.stdout:
                 line = line.rstrip()
                 if self.verbose:
-                    print(f"CDB > {line}")
+                    print(f"Debugger > {line}")
 
                 with self.lock:
                     buffer.append(line)
@@ -169,36 +236,36 @@ class CDBSession:
                         self.ready_event.set()
         except (IOError, ValueError) as e:
             if self.verbose:
-                print(f"CDB output reader error: {e}")
+                print(f"Debugger output reader error: {e}")
 
     def _wait_for_prompt(self, timeout=None):
-        """Wait for CDB to be ready for commands by sending a marker"""
+        """Wait for debugger to be ready for commands by sending a marker"""
         try:
             self.ready_event.clear()
             self.process.stdin.write(f"{COMMAND_MARKER}\n")
             self.process.stdin.flush()
 
             if not self.ready_event.wait(timeout=timeout or self.timeout):
-                raise CDBError(f"Timed out waiting for CDB prompt")
+                raise CDBError("Timed out waiting for debugger prompt")
         except IOError as e:
-            raise CDBError(f"Failed to communicate with CDB: {str(e)}")
+            raise CDBError(f"Failed to communicate with debugger: {str(e)}")
 
     def send_command(self, command: str, timeout: Optional[int] = None) -> List[str]:
         """
-        Send a command to CDB and return the output
+        Send a command to the debugger and return the output
 
         Args:
             command: The command to send
             timeout: Custom timeout for this command (overrides instance timeout)
 
         Returns:
-            List of output lines from CDB
+            List of output lines from the debugger
 
         Raises:
             CDBError: If the command times out or CDB is not responsive
         """
         if not self.process:
-            raise CDBError("CDB process is not running")
+            raise CDBError("Debugger process is not running")
 
         self.ready_event.clear()
         with self.lock:
@@ -215,19 +282,25 @@ class CDBSession:
         if not self.ready_event.wait(timeout=cmd_timeout):
             raise CDBError(f"Command timed out after {cmd_timeout} seconds: {command}")
 
+        self.prompt_ready = True
         with self.lock:
             result = self.output_lines.copy()
             self.output_lines = []
         return result
 
     def shutdown(self):
-        """Clean up and terminate the CDB process"""
+        """Clean up and terminate the debugger process"""
         try:
             if self.process and self.process.poll() is None:
                 try:
                     if self.remote_connection:
                         # For remote connections, send CTRL+B to detach
                         self.process.stdin.write("\x02")  # CTRL+B
+                        self.process.stdin.flush()
+                    elif self.is_kernel:
+                        self.process.stdin.write(".detach\n")
+                        self.process.stdin.flush()
+                        self.process.stdin.write("q\n")
                         self.process.stdin.flush()
                     else:
                         # For dump files, send 'q' to quit
@@ -247,13 +320,13 @@ class CDBSession:
             self.process = None
 
     def send_ctrl_break(self) -> None:
-        """Send a CTRL+BREAK event to the CDB process to break in.
+        """Send a CTRL+BREAK event to the debugger process to break in.
 
         Raises:
             CDBError: If the signal cannot be delivered or the process is not running.
         """
         if not self.process or self.process.poll() is not None:
-            raise CDBError("CDB process is not running")
+            raise CDBError("Debugger process is not running")
 
         try:
             # On Windows, deliver CTRL+BREAK to the new process group we created
@@ -267,6 +340,10 @@ class CDBSession:
             return os.path.abspath(self.dump_path)
         elif self.remote_connection:
             return f"remote:{self.remote_connection}"
+        elif self.kernel_connection:
+            return f"kernel:{self.kernel_connection}"
+        elif self.local_kernel:
+            return "kernel:local"
         else:
             raise CDBError("Session has no valid identifier")
 
